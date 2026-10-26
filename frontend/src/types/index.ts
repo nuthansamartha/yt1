@@ -18,6 +18,24 @@ export interface VideoInfo {
   availableResolutions: number[]; // Array of heights e.g., [2160, 1080, 720]
 }
 
+export interface PlaylistVideoEntry {
+  id: string;
+  title: string;
+  thumbnail: string;
+  duration: number;
+  uploader: string;
+  index: number;
+}
+
+export interface PlaylistInfo {
+  id: string;
+  title: string;
+  uploader: string;
+  thumbnail: string;
+  videoCount: number;
+  videos: PlaylistVideoEntry[];
+}
+
 export type JobStatus =
   | 'queued'
   | 'fetching'
@@ -35,6 +53,33 @@ export interface DownloadJob {
   eta?: string;
   filename?: string;
   originalTitle?: string;
+  downloadUrl?: string;
+  error?: string;
+  isPlaylist?: boolean;
+  totalCount?: number;
+  completedCount?: number;
+  failedCount?: number;
+  remainingCount?: number;
+  jobs?: {
+    jobId: string;
+    videoId: string;
+    status: JobStatus;
+    progress: number;
+    speed?: string;
+    eta?: string;
+    downloadUrl?: string;
+  }[];
+}
+
+export interface PlaylistDownloadJob {
+  jobId: string;
+  videoId: string;
+  title: string;
+  thumbnail: string;
+  status: JobStatus;
+  progress: number;
+  speed?: string;
+  eta?: string;
   downloadUrl?: string;
   error?: string;
 }

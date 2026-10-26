@@ -1,4 +1,4 @@
-import { VideoInfo, DownloadJob } from '../types';
+import { VideoInfo, PlaylistInfo, DownloadJob } from '../types';
 
 const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '') + '/api';
 
@@ -9,10 +9,9 @@ export class ApiError extends Error {
   }
 }
 
-/**
- * Safely parse a fetch Response as JSON.
+/** Safely parse a fetch Response as JSON.
  * If the body is empty or non-JSON (e.g. HTML error page from a proxy),
- * return a fallback object instead of crashing with "Unexpected end of JSON input".
+ * return an object instead of "Unexpected end of JSON input".
  */
 async function safeJson(response: Response): Promise<any> {
   const text = await response.text();
@@ -46,7 +45,12 @@ async function requestApi(url: string, options?: RequestInit): Promise<any> {
   return data;
 }
 
-export async function getVideoInfo(url: string): Promise<VideoInfo> {
+/** Analyze a URL — the backend auto-detects whether it's a video or playlist.
+ * Returns { type: 'video', video: VideoInfo } or { type: 'playlist', playlist: PlaylistInfo }
+ */
+export async function analyzeUrl(
+  url: string
+): Promise<{ type: 'video'; video: VideoInfo } | { type: 'playlist'; playlist: PlaylistInfo }> {
   const data = await requestApi(`${API_BASE_URL}/info`, {
     method: 'POST',
     headers: {
@@ -55,7 +59,20 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
     body: JSON.stringify({ url })
   });
 
-  return data.video;
+  if (data.type === 'playlist') {
+    return { type: 'playlist', playlist: data.playlist };
+  }
+
+  return { type: 'video', video: data.video || data };
+}
+
+/** @deprecated Use analyzeUrl instead */
+export async function getVideoInfo(url: string): Promise<VideoInfo> {
+  const result = await analyzeUrl(url);
+  if (result.type === 'video') {
+    return result.video;
+  }
+  throw new ApiError('Expected a video URL but got a playlist', 400);
 }
 
 export async function startDownload(
@@ -74,18 +91,42 @@ export async function startDownload(
   return { jobId: data.jobId };
 }
 
+/** Start batch download for selected playlist videos.
+ * Returns an array of { jobId, videoId } pairs.
+ */
+export async function startBatchDownload(
+  videoIds: string[],
+  format: 'mp4' | 'mp3',
+  quality: number | string
+): Promise<{ jobId: string; videoId: string }[]> {
+  const data = await requestApi(`${API_BASE_URL}/playlist/download`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ videoIds, format, quality })
+  });
+
+  return data.jobs || [];
+}
+
 export async function getDownloadStatus(jobId: string): Promise<DownloadJob> {
   const data = await requestApi(`${API_BASE_URL}/download/status/${encodeURIComponent(jobId)}`);
 
+  const serverUrl = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+  const downloadUrl = data.downloadUrl
+    ? `${serverUrl}${data.downloadUrl.startsWith('/') ? '' : '/'}${data.downloadUrl}`
+    : undefined;
+
   return {
-    id: data.jobId,
+    id: data.jobId || jobId,
     status: data.status,
-    progress: data.progress,
+    progress: data.progress ?? 0,
     speed: data.speed,
     eta: data.eta,
     filename: data.filename,
     originalTitle: data.originalTitle,
-    downloadUrl: data.downloadUrl ? `${(import.meta.env.VITE_API_URL || '').replace(/\/$/, '')}${data.downloadUrl}` : undefined,
+    downloadUrl,
     error: data.error
   };
 }
@@ -97,5 +138,6 @@ export async function cancelDownload(jobId: string): Promise<void> {
 }
 
 export function getDownloadFileUrl(jobId: string): string {
-  return `${(import.meta.env.VITE_API_URL || '').replace(/\/$/, '')}/api/download/file/${encodeURIComponent(jobId)}`;
+  const serverUrl = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+  return `${serverUrl}/api/download/file/${encodeURIComponent(jobId)}`;
 }

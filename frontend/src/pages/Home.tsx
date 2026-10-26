@@ -7,8 +7,15 @@ import { DownloadButton } from '../components/DownloadButton';
 import { ProgressBar } from '../components/ProgressBar';
 import { DownloadHistory } from '../components/DownloadHistory';
 import { ErrorMessage } from '../components/ErrorMessage';
-import { VideoInfo as VideoInfoType, DownloadJob, DownloadHistoryItem } from '../types';
-import { getVideoInfo, startDownload, getDownloadStatus, cancelDownload, ApiError } from '../services/api';
+import { VideoInfo as VideoInfoType, DownloadJob, DownloadHistoryItem, PlaylistInfo } from '../types';
+import {
+  analyzeUrl,
+  startDownload,
+  startBatchDownload,
+  getDownloadStatus,
+  cancelDownload,
+  ApiError
+} from '../services/api';
 import { Sparkles, Shield, Zap, Film } from 'lucide-react';
 
 const STORAGE_KEY = 'yt_downloader_history_v1';
@@ -16,9 +23,10 @@ const STORAGE_KEY = 'yt_downloader_history_v1';
 export const Home: React.FC = () => {
   const [analyzedUrl, setAnalyzedUrl] = useState<string>('');
   const [videoInfo, setVideoInfo] = useState<VideoInfoType | null>(null);
+  const [playlistInfo, setPlaylistInfo] = useState<PlaylistInfo | null>(null);
   const [format, setFormat] = useState<'mp4' | 'mp3'>('mp4');
   const [quality, setQuality] = useState<number | string>('best');
-  
+
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [isStartingDownload, setIsStartingDownload] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -56,46 +64,102 @@ export const Home: React.FC = () => {
     setError(null);
     setVideoInfo(null);
     setActiveJob(null);
+    setPlaylistInfo(null);
 
     try {
-      const info = await getVideoInfo(url);
-      setVideoInfo(info);
-      setAnalyzedUrl(url);
-      setFormat('mp4');
-      setQuality('best');
+      const result = await analyzeUrl(url);
+
+      if (result.type === 'playlist') {
+        setPlaylistInfo(result.playlist);
+        setAnalyzedUrl(url);
+        setFormat('mp4');
+        setQuality('best');
+      } else {
+        setVideoInfo(result.video);
+        setAnalyzedUrl(url);
+        setFormat('mp4');
+        setQuality('best');
+      }
     } catch (err: any) {
       console.error('[Home] Analyze error:', err);
-      setError(err.message || 'Unable to download this video. Please verify that the URL is valid and that the video is publicly accessible.');
+      setError(
+        err.message ||
+          'Unable to download this video. Please verify that the URL is valid and that the video is publicly accessible.'
+      );
     } finally {
       setIsAnalyzing(false);
     }
   };
 
   const handleStartDownload = async () => {
-    if (!analyzedUrl || !videoInfo) return;    setError(null);
-    setIsStartingDownload(true);
-    try {
-      const { jobId } = await startDownload(analyzedUrl, format, quality);
+    if (!analyzedUrl) return;
+    setError(null);
 
-      const initialJob: DownloadJob = {
-        id: jobId,
-        status: 'queued',
-        progress: 0,
-        originalTitle: videoInfo.title
-      };
-      setActiveJob(initialJob);
+    // If we have playlist info, start batch playlist download
+    if (playlistInfo && playlistInfo.videos && playlistInfo.videos.length > 0) {
+      setIsStartingDownload(true);
+      try {
+        const jobs = await startBatchDownload(
+          playlistInfo.videos.map((v) => v.id),
+          format,
+          quality
+        );
 
-      // Start polling for progress
-      startPolling(jobId);
-    } catch (err: any) {
-      console.error('[Home] Download launch error:', err);
-      setError(err.message || 'Failed to start download job. Please try again.');
-    } finally {
-      setIsStartingDownload(false);
+        if (!jobs || jobs.length === 0) {
+          throw new Error('No valid videos found in the playlist to download.');
+        }
+
+        const initialJob: DownloadJob = {
+          id: 'playlist-' + Date.now(),
+          status: 'queued',
+          progress: 0,
+          originalTitle: playlistInfo.title,
+          isPlaylist: true,
+          totalCount: jobs.length,
+          completedCount: 0,
+          failedCount: 0,
+          remainingCount: jobs.length,
+          jobs: jobs.map((j) => ({
+            jobId: j.jobId,
+            videoId: j.videoId,
+            status: 'queued',
+            progress: 0
+          }))
+        };
+        setActiveJob(initialJob);
+
+        startBatchTracking(initialJob, jobs);
+      } catch (err: any) {
+        console.error('[Home] Playlist download launch error:', err);
+        setError(err.message || 'Failed to start playlist download. Please try again.');
+      } finally {
+        setIsStartingDownload(false);
+      }
+    } else if (analyzedUrl && videoInfo) {
+      // Existing single video download
+      setIsStartingDownload(true);
+      try {
+        const { jobId } = await startDownload(analyzedUrl, format, quality);
+
+        const initialJob: DownloadJob = {
+          id: jobId,
+          status: 'queued',
+          progress: 0,
+          originalTitle: videoInfo.title
+        };
+        setActiveJob(initialJob);
+
+        startTracking(jobId);
+      } catch (err: any) {
+        console.error('[Home] Download launch error:', err);
+        setError(err.message || 'Failed to start download job. Please try again.');
+      } finally {
+        setIsStartingDownload(false);
+      }
     }
   };
 
-  const startPolling = (jobId: string) => {
+  const startTracking = (jobId: string) => {
     if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
 
     let consecutiveErrors = 0;
@@ -116,11 +180,16 @@ export const Home: React.FC = () => {
               title: videoInfo.title,
               thumbnail: videoInfo.thumbnail,
               format,
-              quality: quality === 'best' ? 'Best Available' : typeof quality === 'number' ? `${quality}p` : `${quality} kbps`,
+              quality:
+                quality === 'best'
+                  ? 'Best Available'
+                  : typeof quality === 'number'
+                  ? `${quality}p`
+                  : `${quality} kbps`,
               timestamp: Date.now(),
               downloadUrl: jobStatus.downloadUrl
             };
-            setHistory((prev) => [newItem, ...prev.filter((h) => h.id !== jobId)].slice(0, 10));
+            setHistory((prev) => [newItem, ...prev.filter((h) => h.id !== jobId)].slice(0, 50));
           }
         } else if (jobStatus.status === 'failed') {
           if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
@@ -133,13 +202,131 @@ export const Home: React.FC = () => {
         // 404 = job expired/unknown; give up cleanly instead of hammering the API
         if (status === 404 || consecutiveErrors >= 8) {
           if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
-          setError(status === 404
-            ? 'Download job not found on the server (it may have expired). Please start the download again.'
-            : 'Lost connection to the server while tracking the download.');
+          setError(
+            status === 404
+              ? 'Download job not found on the server (it may have expired). Please start the download again.'
+              : 'Lost connection to the server while tracking the download.'
+          );
           return;
         }
       }
     }, 1500);
+  };
+
+  const startBatchTracking = (
+    initialJob: DownloadJob,
+    batchJobs: { jobId: string; videoId: string }[]
+  ) => {
+    if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
+
+    let consecutiveErrors = 0;
+    const currentBatchJob = { ...initialJob };
+
+    pollingTimerRef.current = setInterval(async () => {
+      try {
+        let totalProgressSum = 0;
+        let completedCount = 0;
+        let failedCount = 0;
+
+        const updatedSubJobs = await Promise.all(
+          batchJobs.map(async (bj) => {
+            try {
+              const status = await getDownloadStatus(bj.jobId);
+              if (status.status === 'completed') completedCount++;
+              else if (status.status === 'failed') failedCount++;
+              totalProgressSum += status.progress || 0;
+
+              return {
+                jobId: bj.jobId,
+                videoId: bj.videoId,
+                status: status.status,
+                progress: status.progress,
+                speed: status.speed,
+                eta: status.eta,
+                downloadUrl: status.downloadUrl
+              };
+            } catch (err) {
+              return {
+                jobId: bj.jobId,
+                videoId: bj.videoId,
+                status: 'queued' as const,
+                progress: 0
+              };
+            }
+          })
+        );
+
+        consecutiveErrors = 0;
+
+        const totalCount = batchJobs.length;
+        const overallProgress = totalCount > 0 ? Math.round(totalProgressSum / totalCount) : 0;
+        const remainingCount = totalCount - completedCount - failedCount;
+        const isAllDone = totalCount > 0 && completedCount + failedCount === totalCount;
+
+        const currentStatus = isAllDone
+          ? completedCount > 0
+            ? 'completed'
+            : 'failed'
+          : 'downloading';
+
+        currentBatchJob.jobs = updatedSubJobs;
+        currentBatchJob.progress = overallProgress;
+        currentBatchJob.status = currentStatus;
+        currentBatchJob.completedCount = completedCount;
+        currentBatchJob.failedCount = failedCount;
+        currentBatchJob.remainingCount = remainingCount;
+
+        setActiveJob({ ...currentBatchJob });
+
+        if (isAllDone) {
+          if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
+
+          // Add all completed videos to history
+          if (playlistInfo && playlistInfo.videos) {
+            const newHistoryItems: DownloadHistoryItem[] = [];
+            for (let i = 0; i < updatedSubJobs.length; i++) {
+              const subJob = updatedSubJobs[i];
+              if (subJob.status === 'completed' && subJob.downloadUrl) {
+                const videoEntry =
+                  playlistInfo.videos.find((v) => v.id === subJob.videoId) || playlistInfo.videos[i];
+                newHistoryItems.push({
+                  id: subJob.jobId,
+                  title: videoEntry?.title || `Video ${i + 1}`,
+                  thumbnail: videoEntry?.thumbnail || playlistInfo.thumbnail || '',
+                  format,
+                  quality:
+                    quality === 'best'
+                      ? 'Best Available'
+                      : typeof quality === 'number'
+                      ? `${quality}p`
+                      : `${quality} kbps`,
+                  timestamp: Date.now(),
+                  downloadUrl: subJob.downloadUrl
+                });
+              }
+            }
+
+            if (newHistoryItems.length > 0) {
+              setHistory((prev) => {
+                const ids = new Set(newHistoryItems.map((item) => item.id));
+                return [...newHistoryItems, ...prev.filter((h) => !ids.has(h.id))].slice(0, 50);
+              });
+            }
+          }
+
+          if (completedCount === 0) {
+            setError('All playlist video downloads failed.');
+          }
+        }
+      } catch (err: any) {
+        console.error('[Home] Batch polling error:', err);
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= 8) {
+          if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
+          setError('Lost connection to the server while tracking playlist downloads.');
+        }
+      }
+    }, 2000);
   };
 
   const handleCancelDownload = async () => {
@@ -147,7 +334,13 @@ export const Home: React.FC = () => {
     if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
 
     try {
-      await cancelDownload(activeJob.id);
+      if (activeJob.isPlaylist && activeJob.jobs) {
+        await Promise.all(
+          activeJob.jobs.map((j) => cancelDownload(j.jobId).catch(() => {}))
+        );
+      } else {
+        await cancelDownload(activeJob.id);
+      }
     } catch (e) {
       console.warn('[Home] Cancel request error:', e);
     } finally {
@@ -178,13 +371,21 @@ export const Home: React.FC = () => {
           <Sparkles className="w-3.5 h-3.5" />
           <span>Full 4K Ultra HD & High-Bitrate Audio Support</span>
         </div>
-        
+
         <h1 className="text-3xl sm:text-5xl font-extrabold tracking-tight text-gray-900 dark:text-white">
           Download YouTube Media in <span className="gradient-text">Highest Quality</span>
         </h1>
 
         <p className="text-sm sm:text-base text-gray-600 dark:text-gray-400 max-w-xl mx-auto">
-          Fast, safe, and secure video downloader leveraging native <code className="font-mono text-xs bg-gray-200 dark:bg-gray-800 px-1 py-0.5 rounded">yt-dlp</code> and <code className="font-mono text-xs bg-gray-200 dark:bg-gray-800 px-1 py-0.5 rounded">FFmpeg</code> engine.
+          Fast, safe, and secure video downloader leveraging native{' '}
+          <code className="font-mono text-xs bg-gray-200 dark:bg-gray-800 px-1 py-0.5 rounded">
+            yt-dlp
+          </code>{' '}
+          and{' '}
+          <code className="font-mono text-xs bg-gray-200 dark:bg-gray-800 px-1 py-0.5 rounded">
+            FFmpeg
+          </code>{' '}
+          engine.
         </p>
       </div>
 
@@ -196,7 +397,7 @@ export const Home: React.FC = () => {
         {/* Error notification */}
         {error && <ErrorMessage message={error} onDismiss={() => setError(null)} />}
 
-        {/* Step 2: Video Metadata & Options */}
+        {/* Step 2: Single Video Metadata & Options */}
         {videoInfo && !activeJob && (
           <div className="space-y-6 pt-4 border-t border-gray-200/80 dark:border-gray-700/60 animate-fadeIn">
             <VideoInfo info={videoInfo} />
@@ -225,6 +426,55 @@ export const Home: React.FC = () => {
           </div>
         )}
 
+        {/* Step 2: Playlist preview & Options */}
+        {playlistInfo && !activeJob && (
+          <div className="space-y-6 pt-4 border-t border-gray-200/80 dark:border-gray-700/60 animate-fadeIn">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-bold text-gray-900 dark:text-white">
+                {playlistInfo.title}
+              </h2>
+              <p className="text-sm font-medium text-rose-500 dark:text-rose-400">
+                {playlistInfo.videos.length} videos found
+              </p>
+            </div>
+
+            {/* Simplified playlist video preview */}
+            <VideoInfo
+              info={{
+                id: playlistInfo.videos?.[0]?.id || playlistInfo.id,
+                title: `${playlistInfo.title} (${playlistInfo.videos.length} videos)`,
+                thumbnail: playlistInfo.thumbnail || playlistInfo.videos?.[0]?.thumbnail || '',
+                duration: playlistInfo.videos?.reduce((acc, v) => acc + (v.duration || 0), 0) || 0,
+                uploader: playlistInfo.uploader || 'YouTube Playlist',
+                formats: [],
+                availableResolutions: [1080, 720, 480, 360]
+              }}
+            />
+
+            <FormatSelector
+              selectedFormat={format}
+              onChangeFormat={(f) => {
+                setFormat(f);
+                setQuality('best');
+              }}
+            />
+
+            <QualitySelector
+              format={format}
+              selectedQuality={quality}
+              onChangeQuality={setQuality}
+              availableResolutions={[1080, 720, 480, 360]}
+            />
+
+            <DownloadButton
+              onStartDownload={handleStartDownload}
+              isDownloading={isStartingDownload}
+              format={format}
+              quality={quality}
+            />
+          </div>
+        )}
+
         {/* Step 3: Download Progress Bar */}
         {activeJob && (
           <div className="pt-4 border-t border-gray-200/80 dark:border-gray-700/60">
@@ -240,15 +490,19 @@ export const Home: React.FC = () => {
             <Film className="w-4 h-4" />
           </div>
           <h4 className="font-bold text-sm text-gray-900 dark:text-white">Up to 4K / 2160p</h4>
-          <p className="text-xs text-gray-500 dark:text-gray-400">Merges 4K video & high quality audio tracks seamlessly</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Merges 4K video & high quality audio tracks seamlessly
+          </p>
         </div>
 
         <div className="p-4 rounded-2xl bg-white dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700/60 shadow-sm space-y-1">
           <div className="w-8 h-8 rounded-xl bg-rose-50 dark:bg-rose-950/40 text-rose-500 mx-auto flex items-center justify-center font-bold">
             <Zap className="w-4 h-4" />
           </div>
-          <h4 className="font-bold text-sm text-gray-900 dark:text-white">Real-Time Progress</h4>
-          <p className="text-xs text-gray-500 dark:text-gray-400">Live job tracking & status updates derived from yt-dlp</p>
+          <h4 className="font-bold text-sm text-gray-900 dark:text-white">Real-time Progress</h4>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Live job tracking & status updates derived from yt-dlp
+          </p>
         </div>
 
         <div className="p-4 rounded-2xl bg-white dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700/60 shadow-sm space-y-1">
@@ -256,7 +510,9 @@ export const Home: React.FC = () => {
             <Shield className="w-4 h-4" />
           </div>
           <h4 className="font-bold text-sm text-gray-900 dark:text-white">Secure & Safe</h4>
-          <p className="text-xs text-gray-500 dark:text-gray-400">Strict SSRF validation, sanitized filenames, no command injection</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Strict SSRF validation, sanitized filenames, no command injection
+          </p>
         </div>
       </div>
 

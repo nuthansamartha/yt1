@@ -12,15 +12,17 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({ job, onReset, onCancel
   const getStatusLabel = (): string => {
     switch (job.status) {
       case 'queued':
-        return 'Job queued...';
+        return job.isPlaylist ? 'Playlist queued...' : 'Job queued...';
       case 'fetching':
-        return 'Preparing stream & metadata...';
+        return job.isPlaylist ? 'Preparing playlist videos...' : 'Preparing stream & metadata...';
       case 'downloading':
-        return `Downloading media streams (${job.progress}%)`;
+        return job.isPlaylist && job.totalCount
+          ? `Downloading playlist (${job.completedCount || 0}/${job.totalCount} completed - ${job.progress}%)`
+          : `Downloading media streams (${job.progress}%)`;
       case 'processing':
         return 'Merging audio & video formats (FFmpeg)...';
       case 'completed':
-        return 'Download Ready!';
+        return job.isPlaylist ? 'Playlist Download Complete!' : 'Download Ready!';
       case 'failed':
         return 'Download Failed';
       default:
@@ -97,23 +99,25 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({ job, onReset, onCancel
         </div>
       )}
 
-      {isCompleted && job.downloadUrl && (
+      {isCompleted && (
         <div className="pt-2 flex flex-col sm:flex-row gap-3">
-          <a
-            href={job.downloadUrl}
-            download
-            className="flex-1 py-3 px-5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl shadow-md flex items-center justify-center space-x-2 text-sm transition-colors"
-          >
-            <Download className="w-4 h-4" />
-            <span>Save Downloaded File</span>
-          </a>
+          {job.downloadUrl && (
+            <a
+              href={job.downloadUrl}
+              download
+              className="flex-1 py-3 px-5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl shadow-md flex items-center justify-center space-x-2 text-sm transition-colors"
+            >
+              <Download className="w-4 h-4" />
+              <span>Save Downloaded File</span>
+            </a>
+          )}
 
           <button
             type="button"
             onClick={onReset}
-            className="py-3 px-5 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 font-semibold rounded-xl text-sm transition-colors"
+            className="flex-1 py-3 px-5 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 font-semibold rounded-xl text-sm transition-colors"
           >
-            Download Another Video
+            {job.isPlaylist ? 'Download Another Video / Playlist' : 'Download Another Video'}
           </button>
         </div>
       )}

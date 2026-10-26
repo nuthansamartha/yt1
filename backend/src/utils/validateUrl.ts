@@ -1,6 +1,7 @@
 /**
  * Utility for validating user-provided YouTube URLs.
  * Enforces security restrictions against SSRF and command injection.
+ * Supports individual video URLs and playlist URLs.
  */
 
 const ALLOWED_HOSTNAMES = new Set([
@@ -16,6 +17,8 @@ export interface UrlValidationResult {
   error?: string;
   sanitizedUrl?: string;
   videoId?: string;
+  playlistId?: string;
+  type?: 'video' | 'playlist';
 }
 
 export function validateYouTubeUrl(inputUrl: string): UrlValidationResult {
@@ -58,6 +61,43 @@ export function validateYouTubeUrl(inputUrl: string): UrlValidationResult {
     return { isValid: false, error: 'Only supported YouTube domains are allowed (youtube.com, youtu.be)' };
   }
 
+  // --- Check for playlist URL first ---
+  // Playlist URL formats:
+  //   https://www.youtube.com/playlist?list=PLxxxxxx
+  //   https://www.youtube.com/watch?v=VIDEO_ID&list=PLxxxxxx (video in playlist context)
+  const playlistId = parsed.searchParams.get('list');
+
+  if (parsed.pathname === '/playlist' && playlistId) {
+    // Pure playlist URL — no individual video
+    if (!/^[a-zA-Z0-9_-]{10,80}$/.test(playlistId)) {
+      return { isValid: false, error: 'Invalid YouTube playlist ID format' };
+    }
+
+    const sanitizedUrl = `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`;
+    return {
+      isValid: true,
+      sanitizedUrl,
+      playlistId,
+      type: 'playlist'
+    };
+  }
+
+  // If a watch URL has both a video ID and a list param, treat it as a playlist
+  if (parsed.pathname === '/watch' && playlistId && parsed.searchParams.get('v')) {
+    if (!/^[a-zA-Z0-9_-]{10,80}$/.test(playlistId)) {
+      return { isValid: false, error: 'Invalid YouTube playlist ID format' };
+    }
+
+    const sanitizedUrl = `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`;
+    return {
+      isValid: true,
+      sanitizedUrl,
+      playlistId,
+      type: 'playlist'
+    };
+  }
+
+  // --- Single video URL ---
   let videoId: string | null = null;
 
   if (hostname === 'youtu.be') {
@@ -80,7 +120,7 @@ export function validateYouTubeUrl(inputUrl: string): UrlValidationResult {
   }
 
   if (!videoId || videoId.trim().length === 0) {
-    return { isValid: false, error: 'Could not extract a valid YouTube video ID from the provided URL' };
+    return { isValid: false, error: 'Could not extract a valid YouTube video or playlist ID from the provided URL' };
   }
 
   // Clean video ID check (alphanumeric, hyphens, underscores typically 11 chars)
@@ -94,6 +134,7 @@ export function validateYouTubeUrl(inputUrl: string): UrlValidationResult {
   return {
     isValid: true,
     sanitizedUrl,
-    videoId
+    videoId,
+    type: 'video'
   };
 }

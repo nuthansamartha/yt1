@@ -23,7 +23,26 @@ export interface YtdlpVideoMetadata {
   availableResolutions: number[]; // e.g. [2160, 1080, 720]
 }
 
+export interface PlaylistVideoEntry {
+  id: string;
+  title: string;
+  thumbnail: string;
+  duration: number;
+  uploader: string;
+  index: number;
+}
+
+export interface PlaylistMetadata {
+  id: string;
+  title: string;
+  uploader: string;
+  thumbnail: string;
+  videoCount: number;
+  videos: PlaylistVideoEntry[];
+}
+
 const METADATA_TIMEOUT_MS = 30_000;
+const PLAYLIST_TIMEOUT_MS = 60_000;
 
 export class YtdlpService {
   private static isYtdlpAvailable: boolean = false;
@@ -660,5 +679,99 @@ export class YtdlpService {
     }
 
     return killHandle;
+  }
+
+  /**
+   * Fetch playlist metadata via yt-dlp --flat-playlist --dump-single-json.
+   * Returns the playlist title, uploader, and a list of video entries.
+   */
+  public static async getPlaylistInfo(url: string): Promise<PlaylistMetadata> {
+    const { ytdlpCmd, ffmpegLocation } = this.getExecutablePaths();
+
+    const args = [
+      '--dump-single-json',
+      '--flat-playlist',
+      '--no-warnings',
+      '--skip-download',
+    ];
+
+    if (ffmpegLocation) {
+      args.push('--ffmpeg-location', ffmpegLocation);
+    }
+
+    const cookiesFile = this.getCookiesFilePath();
+    if (cookiesFile) {
+      args.push('--cookies', cookiesFile);
+    }
+
+    args.push(url);
+
+    const result = await new Promise<{ data: string; stderr: string; code: number | null }>((resolve) => {
+      const child = spawn(ytdlpCmd, args, { shell: false });
+      let stdoutData = '';
+      let stderrData = '';
+      let settled = false;
+
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.killProcessTree(child);
+        resolve({ data: stdoutData, stderr: `${stderrData}\nERROR: playlist fetch timed out`, code: -1 });
+      }, PLAYLIST_TIMEOUT_MS);
+
+      child.stdout.on('data', (d) => { stdoutData += d.toString(); });
+      child.stderr.on('data', (d) => { stderrData += d.toString(); });
+
+      child.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve({ data: '', stderr: err.message, code: -1 });
+      });
+
+      child.on('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve({ data: stdoutData, stderr: stderrData, code });
+      });
+    });
+
+    if (result.code !== 0 || !result.data) {
+      const errorLine = result.stderr.split('\n').find((l) => l.startsWith('ERROR:')) || '';
+      const detail = errorLine ? ` (${errorLine.replace('ERROR:', '').trim()})` : '';
+      throw new Error(`Failed to retrieve playlist information${detail}. Please ensure the URL is valid and the playlist is public.`);
+    }
+
+    try {
+      const rawInfo = JSON.parse(result.data);
+      const entries = Array.isArray(rawInfo.entries) ? rawInfo.entries : [];
+
+      const videos: PlaylistVideoEntry[] = entries
+        .filter((entry: any) => entry && entry.id)
+        .map((entry: any, idx: number) => ({
+          id: String(entry.id),
+          title: String(entry.title || `Video ${idx + 1}`),
+          thumbnail: String(
+            entry.thumbnails?.[entry.thumbnails.length - 1]?.url ||
+            entry.thumbnail ||
+            `https://i.ytimg.com/vi/${entry.id}/hqdefault.jpg`
+          ),
+          duration: Number(entry.duration || 0),
+          uploader: String(entry.uploader || entry.channel || rawInfo.uploader || 'Unknown'),
+          index: idx + 1,
+        }));
+
+      return {
+        id: String(rawInfo.id || ''),
+        title: String(rawInfo.title || 'Untitled Playlist'),
+        uploader: String(rawInfo.uploader || rawInfo.channel || 'Unknown'),
+        thumbnail: videos[0]?.thumbnail || '',
+        videoCount: videos.length,
+        videos,
+      };
+    } catch (err: any) {
+      throw new Error(`Failed to parse playlist metadata: ${err.message}`);
+    }
   }
 }

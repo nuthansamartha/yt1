@@ -12,7 +12,7 @@ export const UrlInput: React.FC<UrlInputProps> = ({ onAnalyze, isLoading }) => {
 
   const validateClientUrl = (input: string): boolean => {
     if (!input.trim()) {
-      setValidationError('Please paste a YouTube video URL.');
+      setValidationError('Please paste a YouTube video or playlist URL.');
       return false;
     }
 
@@ -77,7 +77,7 @@ export const UrlInput: React.FC<UrlInputProps> = ({ onAnalyze, isLoading }) => {
             type="url"
             value={url}
             onChange={handleInputChange}
-            placeholder="Paste YouTube URL here... (e.g. https://www.youtube.com/watch?v=...)"
+            placeholder="Paste YouTube video or playlist URL..."
             disabled={isLoading}
             className="w-full py-4 pl-3 pr-44 text-base text-gray-900 dark:text-gray-100 placeholder-gray-400 bg-transparent focus:outline-none disabled:opacity-60"
             aria-label="YouTube URL Input"
@@ -140,6 +140,7 @@ export const UrlInput: React.FC<UrlInputProps> = ({ onAnalyze, isLoading }) => {
         <span className="font-mono bg-gray-200/60 dark:bg-gray-800 px-1.5 py-0.5 rounded text-gray-600 dark:text-gray-300">youtube.com/watch?v=...</span>
         <span className="font-mono bg-gray-200/60 dark:bg-gray-800 px-1.5 py-0.5 rounded text-gray-600 dark:text-gray-300">youtu.be/...</span>
         <span className="font-mono bg-gray-200/60 dark:bg-gray-800 px-1.5 py-0.5 rounded text-gray-600 dark:text-gray-300">youtube.com/shorts/...</span>
+        <span className="font-mono bg-gray-200/60 dark:bg-gray-800 px-1.5 py-0.5 rounded text-rose-500 dark:text-rose-400 font-semibold">youtube.com/playlist?list=...</span>
       </div>
     </div>
   );

@@ -27,16 +27,112 @@ export class DownloadController {
         return;
       }
 
+      // If it's a playlist URL, redirect to playlist info
+      if (validation.type === 'playlist') {
+        const playlistInfo = await YtdlpService.getPlaylistInfo(validation.sanitizedUrl);
+        res.json({
+          success: true,
+          type: 'playlist',
+          playlist: playlistInfo
+        });
+        return;
+      }
+
       const videoInfo = await YtdlpService.getVideoInfo(validation.sanitizedUrl);
 
       res.json({
         success: true,
+        type: 'video',
         video: videoInfo
       });
     } catch (err: any) {
       res.status(400).json({
         success: false,
         error: err.message || 'Unable to retrieve video information'
+      });
+    }
+  }
+
+  /**
+   * POST /api/playlist/download
+   * Starts download jobs for multiple videos from a playlist.
+   * Body: { videoIds: string[], format: 'mp4' | 'mp3', quality: number | string }
+   */
+  public static async startPlaylistDownload(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { videoIds, format, quality } = req.body;
+
+      if (!Array.isArray(videoIds) || videoIds.length === 0) {
+        res.status(400).json({ success: false, error: 'videoIds array is required and must not be empty' });
+        return;
+      }
+
+      // Cap at 50 videos per batch to prevent abuse
+      if (videoIds.length > 50) {
+        res.status(400).json({ success: false, error: 'Maximum 50 videos can be downloaded at once' });
+        return;
+      }
+
+      const mediaFormat = format === 'mp3' ? 'mp3' : 'mp4';
+      const requestedQuality = quality || 'best';
+
+      const jobs: { jobId: string; videoId: string }[] = [];
+
+      for (const videoId of videoIds) {
+        // Validate each video ID
+        if (!/^[a-zA-Z0-9_-]{5,30}$/.test(videoId)) {
+          continue; // Skip invalid IDs
+        }
+
+        const videoUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
+        const jobId = uuidv4();
+
+        JobManager.createJob(jobId, videoUrl, mediaFormat, requestedQuality);
+        JobManager.updateJob(jobId, { status: 'fetching' });
+
+        // Start background yt-dlp child process for each video
+        const handle = YtdlpService.startDownloadProcess(
+          jobId,
+          videoUrl,
+          mediaFormat,
+          requestedQuality,
+          (progress, statusMsg, speed, eta) => {
+            JobManager.updateJob(jobId, {
+              progress,
+              status: statusMsg as any,
+              speed,
+              eta
+            });
+          },
+          (filename, filepath) => {
+            const currentJob = JobManager.getJob(jobId);
+            JobManager.updateJob(jobId, {
+              status: 'completed',
+              progress: 100,
+              filename,
+              filepath,
+              originalTitle: currentJob?.originalTitle || videoId,
+              speed: undefined,
+              eta: undefined
+            });
+          },
+          (errorMsg) => {
+            JobManager.failJob(jobId, errorMsg);
+          }
+        );
+
+        JobManager.updateJob(jobId, { processKillHandle: handle.kill });
+        jobs.push({ jobId, videoId });
+      }
+
+      res.status(202).json({
+        success: true,
+        jobs
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        success: false,
+        error: err.message || 'Failed to initiate playlist download'
       });
     }
   }
