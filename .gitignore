@@ -17,6 +17,25 @@ build/
 backend/downloads/*
 !backend/downloads/.gitkeep
 
+# Cookie files — NEVER commit these; they contain session credentials
+*.txt
+!backend/.env.example
+# Specific cookie file patterns
+backend/cookies.txt
+backend/www.youtube.com_cookies.txt
+backend/youtube.com_cookies.txt
+backend/bin/cookies.txt
+backend/bin/www.youtube.com_cookies.txt
+*_cookies.txt
+cookies.txt
+
+# yt-dlp and ffmpeg binaries (large, platform-specific)
+backend/bin/yt-dlp
+backend/bin/yt-dlp.exe
+backend/bin/ffmpeg.exe
+backend/bin/ffprobe.exe
+backend/bin/ffmpeg.zip
+
 # IDE / System files
 .DS_Store
 Thumbs.db

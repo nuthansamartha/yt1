@@ -44,6 +44,10 @@ export interface PlaylistMetadata {
 const METADATA_TIMEOUT_MS = 30_000;
 const PLAYLIST_TIMEOUT_MS = 60_000;
 
+// Startup validation: log the resolved cookies path so it's visible in Render
+// logs immediately on boot. Called once from checkDependencies().
+let _cookiesValidated = false;
+
 export class YtdlpService {
   private static isYtdlpAvailable: boolean = false;
   private static isFfmpegAvailable: boolean = false;
@@ -79,8 +83,9 @@ export class YtdlpService {
     const { ytdlpCmd, ffmpegLocation } = this.getExecutablePaths();
 
     try {
-      execSync(`"${ytdlpCmd}" --version`, { stdio: 'ignore' });
+      const version = execSync(`"${ytdlpCmd}" --version`, { encoding: 'utf8' }).trim();
       this.isYtdlpAvailable = true;
+      console.log(`✅ [YtdlpService] yt-dlp found: ${version}`);
     } catch {
       this.isYtdlpAvailable = false;
       console.warn(
@@ -94,6 +99,7 @@ export class YtdlpService {
         : 'ffmpeg';
       execSync(`"${ffmpegBin}" -version`, { stdio: 'ignore' });
       this.isFfmpegAvailable = true;
+      console.log(`✅ [YtdlpService] ffmpeg found and functional`);
     } catch {
       this.isFfmpegAvailable = false;
       console.warn(
@@ -101,11 +107,26 @@ export class YtdlpService {
       );
     }
 
-    const cookiesPath = this.getCookiesFilePath();
-    if (cookiesPath) {
-      console.log(`🍪 [Server] Found YouTube cookies file at: ${cookiesPath}`);
-    } else {
-      console.log(`ℹ️ [Server] No cookies.txt found. (Standard videos work directly; place cookies.txt in backend/ for bot/age-restricted videos)`);
+    if (!_cookiesValidated) {
+      _cookiesValidated = true;
+      const cookiesPath = this.getCookiesFilePath();
+      if (cookiesPath) {
+        // Log the path (safe) but never log file contents
+        console.log(`🍪 [YtdlpService] Cookies file resolved: ${cookiesPath}`);
+        // Validate it is readable
+        try {
+          fs.accessSync(cookiesPath, fs.constants.R_OK);
+          console.log(`✅ [YtdlpService] Cookies file is readable`);
+        } catch {
+          console.warn(`⚠️ [YtdlpService] Cookies file exists but is NOT readable: ${cookiesPath}`);
+        }
+      } else {
+        console.log(
+          `ℹ️ [YtdlpService] No cookies file found. Public videos will work without cookies.\n` +
+          `   To handle bot-verification or age-restricted videos, set YOUTUBE_COOKIES_PATH\n` +
+          `   to the path of a Netscape-format cookies.txt file on Render Secret Files.`
+        );
+      }
     }
 
     return {
@@ -177,12 +198,28 @@ export class YtdlpService {
     return null;
   }
 
+  /**
+   * Detect bot-verification / sign-in / age-gate errors from yt-dlp stderr.
+   * These require a valid YouTube session (cookies) to resolve.
+   */
   private static isAgeOrAuthError(message: string): boolean {
-    return /sign in|confirm (you|your age)|age.restrict|inappropriate|log ?in|nsig|not a bot/i.test(message);
+    return /sign.?in|confirm (you|your age)|age.restrict|inappropriate|log.?in|nsig|not a bot|bot verification|requires? (authentication|login|sign|account)|please sign|join to|members?.only|private.*session|HTTP Error 403/i.test(message);
+  }
+
+  /**
+   * Specifically detect the "Sign in to confirm you're not a bot" message
+   * that YouTube returns when a request looks automated without a session.
+   */
+  private static isBotCheckError(message: string): boolean {
+    return /not a bot|bot verification|confirm you.?re not|confirm that you.?re/i.test(message);
   }
 
   private static isUnavailableError(message: string): boolean {
-    return /video unavailable|private video|removed by the uploader|does not exist/i.test(message);
+    return /video unavailable|private video|removed by the uploader|does not exist|This video is not available|has been removed|account (has been|was) terminated/i.test(message);
+  }
+
+  private static isNetworkError(message: string): boolean {
+    return /connection (refused|timed? ?out|reset)|network (error|failure|unreachable)|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|Unable to connect/i.test(message);
   }
 
   /**
@@ -207,7 +244,16 @@ export class YtdlpService {
    * Chromium-based browsers lock their SQLite cookie DB while open.
    * Returns the browser name if cookies are accessible, null otherwise.
    */
+  /**
+   * Detect an available browser for cookie extraction (Windows-only).
+   * On Linux/Docker (Render production), LOCALAPPDATA is not set and no
+   * browser profiles exist, so this always returns null — which is correct
+   * because the production server should use YOUTUBE_COOKIES_PATH instead.
+   */
   private static detectAvailableBrowser(): string | null {
+    // No browser detection on non-Windows environments (Docker/Render)
+    if (process.platform !== 'win32') return null;
+
     const browsers = [
       { name: 'chrome',   cookieDb: `${process.env.LOCALAPPDATA}\\Google\\Chrome\\User Data\\Default\\Cookies`,           profileDir: `${process.env.LOCALAPPDATA}\\Google\\Chrome\\User Data` },
       { name: 'edge',     cookieDb: `${process.env.LOCALAPPDATA}\\Microsoft\\Edge\\User Data\\Default\\Cookies`,           profileDir: `${process.env.LOCALAPPDATA}\\Microsoft\\Edge\\User Data` },
@@ -221,22 +267,16 @@ export class YtdlpService {
       try {
         if (!browser.profileDir || !fs.existsSync(browser.profileDir)) continue;
 
-        // For Chromium-based browsers, verify we can read (not just that the dir exists)
-        // by attempting to open the cookie file non-exclusively. If it throws EBUSY/EPERM,
-        // the browser is running and has the DB locked.
         if (browser.cookieDb && fs.existsSync(browser.cookieDb)) {
           try {
             const fd = fs.openSync(browser.cookieDb, 'r');
             fs.closeSync(fd);
-            // File is readable — cookies accessible
             return browser.name;
           } catch {
-            // EBUSY or EPERM = browser has it locked, skip
             continue;
           }
         }
 
-        // Firefox uses a different DB format that yt-dlp can handle even while open
         if (browser.name === 'firefox') {
           return 'firefox';
         }
@@ -353,13 +393,18 @@ export class YtdlpService {
     }
 
     const cookiesFile = this.getCookiesFilePath();
-    if (cookiesFile) {
-      console.log(`[YtdlpService] Using cookies from file: ${cookiesFile}`);
-      baseArgs.push('--cookies', cookiesFile);
-    }
 
-    // --- Attempt 1: Standard request ---
-    const result1 = await this.runYtdlpJson(ytdlpCmd, [...baseArgs, url]);
+    // --- Attempt 1: Try WITHOUT cookies first for public videos.
+    //
+    // Reasoning: sending cookies on every request unnecessarily fingerprints
+    // the session and can trigger bot-detection faster. If the video is public,
+    // this succeeds without exposing the session. If YouTube returns a bot-check
+    // or auth error, we retry with cookies in attempt 2.
+    //
+    // Exception: if no cookies file exists, we also skip the cookie retry logic.
+    const attempt1Args = [...baseArgs, url];
+    console.log(`[YtdlpService] Metadata attempt 1 (no cookies) for: ${url}`);
+    const result1 = await this.runYtdlpJson(ytdlpCmd, attempt1Args);
 
     if (result1.code === 0 && result1.data) {
       try {
@@ -373,61 +418,118 @@ export class YtdlpService {
       throw new Error('This video is private, unavailable, or deleted.');
     }
 
-    // --- Attempt 2: Age bypass with TV embedded client ---
-    const bypassArgs = [...baseArgs, ...this.buildAgeBypassArgs(), url];
-    console.log(`[YtdlpService] Metadata attempt 2 (age bypass) for: ${url}`);
-    const result2 = await this.runYtdlpJson(ytdlpCmd, bypassArgs);
+    if (this.isNetworkError(result1.stderr)) {
+      throw new Error('A network error occurred while retrieving video information. Please try again.');
+    }
 
-    if (result2.code === 0 && result2.data) {
+    // --- Attempt 2: Retry WITH cookies file (if available) + age-bypass client ---
+    //
+    // This handles bot-verification, age restrictions, and sign-in prompts.
+    // Only attempted if we actually have a cookies file to avoid a pointless retry.
+    if (cookiesFile) {
+      const attempt2Args = [...baseArgs, '--cookies', cookiesFile, ...this.buildAgeBypassArgs(), url];
+      console.log(`[YtdlpService] Metadata attempt 2 (cookies + age-bypass client) for: ${url}`);
+      const result2 = await this.runYtdlpJson(ytdlpCmd, attempt2Args);
+
+      if (result2.code === 0 && result2.data) {
+        try {
+          console.log(`[YtdlpService] Cookies + age-bypass succeeded for: ${url}`);
+          return this.parseVideoInfo(JSON.parse(result2.data));
+        } catch (err: any) {
+          throw new Error(`Failed to parse video metadata: ${err.message}`);
+        }
+      }
+
+      // Log stderr for diagnostics (no cookie values are logged here)
+      console.error(`[YtdlpService] Attempt 2 (cookies) failed for: ${url}`);
+      console.error(`[YtdlpService] yt-dlp stderr (attempt 2):`, result2.stderr.slice(0, 500));
+
+      if (this.isUnavailableError(result2.stderr)) {
+        throw new Error('This video is private, unavailable, or deleted.');
+      }
+      if (this.isBotCheckError(result2.stderr)) {
+        throw new Error(
+          'YouTube is requesting bot verification. The stored session cookies may have expired. ' +
+          'Please refresh your cookies.txt in the Render Secret Files and redeploy.'
+        );
+      }
+      if (this.isAgeOrAuthError(result2.stderr)) {
+        throw new Error(
+          'This video requires a valid YouTube sign-in. The stored session may be expired or insufficient. ' +
+          'Please update the cookies file and redeploy.'
+        );
+      }
+      throw new Error('Failed to retrieve video information. The video may be restricted, region-locked, or unavailable.');
+    }
+
+    // --- Attempt 2 (no cookies): Age-bypass client flags only ---
+    // No cookies file present — try the alternative player client which sometimes
+    // bypasses age-gating without requiring a signed-in session.
+    const bypassOnlyArgs = [...baseArgs, ...this.buildAgeBypassArgs(), url];
+    console.log(`[YtdlpService] Metadata attempt 2 (age-bypass, no cookies) for: ${url}`);
+    const result2nb = await this.runYtdlpJson(ytdlpCmd, bypassOnlyArgs);
+
+    if (result2nb.code === 0 && result2nb.data) {
       try {
-        console.log(`[YtdlpService] Age bypass succeeded for: ${url}`);
-        return this.parseVideoInfo(JSON.parse(result2.data));
+        console.log(`[YtdlpService] Age-bypass (no cookies) succeeded for: ${url}`);
+        return this.parseVideoInfo(JSON.parse(result2nb.data));
       } catch (err: any) {
         throw new Error(`Failed to parse video metadata: ${err.message}`);
       }
     }
 
-    // --- Attempt 3: Age bypass + browser cookies ---
+    // --- Attempt 3: Browser cookies (Windows dev environment only) ---
     const detectedBrowser = this.detectAvailableBrowser();
-    if (detectedBrowser && !cookiesFile) {
+    if (detectedBrowser) {
       const cookieArgs = [
         ...baseArgs,
         ...this.buildAgeBypassArgs(),
         '--cookies-from-browser', detectedBrowser,
         url
       ];
-      console.log(`[YtdlpService] Metadata attempt 3 (${detectedBrowser} cookies) for: ${url}`);
+      console.log(`[YtdlpService] Metadata attempt 3 (${detectedBrowser} browser cookies) for: ${url}`);
       const result3 = await this.runYtdlpJson(ytdlpCmd, cookieArgs);
 
       if (result3.code === 0 && result3.data) {
         try {
-          console.log(`[YtdlpService] Cookie bypass succeeded via ${detectedBrowser} for: ${url}`);
+          console.log(`[YtdlpService] Browser cookie bypass via ${detectedBrowser} succeeded for: ${url}`);
           return this.parseVideoInfo(JSON.parse(result3.data));
         } catch (err: any) {
           throw new Error(`Failed to parse video metadata: ${err.message}`);
         }
       }
 
-      console.error(`[YtdlpService] All metadata attempts failed. Last stderr:`, result3.stderr);
-
+      console.error(`[YtdlpService] All metadata attempts failed. Last stderr:`, result3.stderr.slice(0, 500));
       if (this.isUnavailableError(result3.stderr)) {
         throw new Error('This video is private, unavailable, or deleted.');
       }
       if (this.isAgeOrAuthError(result3.stderr)) {
-        throw new Error('This video requires YouTube sign-in / bot verification. Place a cookies.txt file in the backend folder to download restricted videos.');
+        throw new Error(
+          'This video requires YouTube sign-in or bot verification. ' +
+          'Add a cookies.txt file via Render Secret Files (YOUTUBE_COOKIES_PATH).'
+        );
       }
-      throw new Error('Failed to retrieve video information. The video may be restricted, region-locked, or deleted.');
+      throw new Error('Failed to retrieve video information. The video may be restricted, region-locked, or unavailable.');
     }
 
-    // No browser found or already attempted cookiesFile
-    console.error(`[YtdlpService] Age bypass failed. Stderr:`, result2.stderr);
-    if (this.isUnavailableError(result2.stderr)) {
+    // All attempts exhausted without cookies
+    console.error(`[YtdlpService] All attempts failed (no cookies). Stderr:`, result2nb.stderr.slice(0, 500));
+    if (this.isUnavailableError(result2nb.stderr)) {
       throw new Error('This video is private, unavailable, or deleted.');
     }
-    if (this.isAgeOrAuthError(result2.stderr)) {
-      throw new Error('This video requires YouTube sign-in or bot verification. Export a cookies.txt file from YouTube and place it inside the backend folder.');
+    if (this.isBotCheckError(result2nb.stderr)) {
+      throw new Error(
+        'YouTube is requesting bot verification for this request. ' +
+        'To access restricted content, configure YOUTUBE_COOKIES_PATH on Render with a valid cookies.txt file.'
+      );
     }
-    throw new Error('Failed to retrieve video information. Please ensure the URL is valid and accessible.');
+    if (this.isAgeOrAuthError(result2nb.stderr)) {
+      throw new Error(
+        'This video requires YouTube sign-in. ' +
+        'Configure YOUTUBE_COOKIES_PATH on Render with a valid cookies.txt file to access restricted content.'
+      );
+    }
+    throw new Error('Failed to retrieve video information. Please verify the URL is valid and the video is publicly accessible.');
   }
 
   /**
@@ -471,18 +573,21 @@ export class YtdlpService {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         '-o', outputTemplate,
       ];
-        
-
 
       if (mode !== 'plain') {
         args.push(...this.buildAgeBypassArgs());
       }
+
+      // Cookies strategy: plain mode tries WITHOUT cookies first (same rationale as
+      // getVideoInfo — reduces session fingerprinting). If plain fails with a bot-check,
+      // the caller retries in 'bypass' or 'cookies' mode which includes the cookies file.
       const cookiesFile = this.getCookiesFilePath();
-      if (cookiesFile) {
+      if (mode !== 'plain' && cookiesFile) {
         args.push('--cookies', cookiesFile);
-      } else if (mode === 'cookies' && browserName) {
+      } else if (mode === 'cookies' && browserName && !cookiesFile) {
         args.push('--cookies-from-browser', browserName);
       }
+
       if (ffmpegLocation) {
         args.push('--ffmpeg-location', ffmpegLocation);
       }
@@ -612,19 +717,19 @@ export class YtdlpService {
             return;
           }
 
-          // Plain attempt blocked by age gate / bot check -> retry with bypass flags
+          // Plain attempt blocked by age gate / bot check -> retry with bypass flags + cookies
           if (mode === 'plain' && isAgeOrSignIn) {
-            console.warn(`[YtdlpService] Plain download rejected for job ${jobId}. Retrying with age-bypass client...`);
+            console.warn(`[YtdlpService] Plain download bot-checked for job ${jobId}. Retrying with age-bypass + cookies...`);
             cleanPartialFiles();
             spawnDownload('bypass');
             return;
           }
 
-          // Bypass attempt still blocked -> last resort: browser cookies
+          // Bypass attempt still blocked -> last resort: browser cookies (Windows only)
           if (mode === 'bypass' && isAgeOrSignIn) {
             const detectedBrowser = this.detectAvailableBrowser();
             if (detectedBrowser) {
-              console.warn(`[YtdlpService] Age-bypass failed for job ${jobId}. Retrying with ${detectedBrowser} cookies...`);
+              console.warn(`[YtdlpService] Age-bypass failed for job ${jobId}. Retrying with ${detectedBrowser} browser cookies...`);
               cleanPartialFiles();
               spawnDownload('cookies', detectedBrowser);
               return;
@@ -637,6 +742,23 @@ export class YtdlpService {
           if (isCookieLock) {
             return fail('Could not access browser cookies (they are locked by a running browser). Please close your browser and retry, or try a non-restricted video.');
           }
+
+          // Distinguish bot-check specifically so the user knows cookies may be expired
+          if (isAgeOrSignIn && mode !== 'plain') {
+            const hasCookies = !!this.getCookiesFilePath();
+            if (hasCookies) {
+              return fail(
+                'YouTube rejected the stored session (bot verification or expired cookies). ' +
+                'Please refresh your cookies.txt on Render and redeploy.'
+              );
+            } else {
+              return fail(
+                'YouTube requires sign-in for this video. ' +
+                'Configure YOUTUBE_COOKIES_PATH on Render with a valid cookies.txt file.'
+              );
+            }
+          }
+
           // Surface the actual yt-dlp error so users/devs can debug
           const errorLine = stderrMsg.split('\n').find((l) => l.startsWith('ERROR:')) || '';
           const detail = errorLine ? ` (${errorLine.replace('ERROR:', '').trim()})` : '';
@@ -739,8 +861,29 @@ export class YtdlpService {
 
     if (result.code !== 0 || !result.data) {
       const errorLine = result.stderr.split('\n').find((l) => l.startsWith('ERROR:')) || '';
-      const detail = errorLine ? ` (${errorLine.replace('ERROR:', '').trim()})` : '';
-      throw new Error(`Failed to retrieve playlist information${detail}. Please ensure the URL is valid and the playlist is public.`);
+      const detail = errorLine ? errorLine.replace('ERROR:', '').trim() : '';
+
+      // Classify the error so the frontend gets an actionable message
+      if (this.isUnavailableError(result.stderr)) {
+        throw new Error('This playlist is private, unavailable, or has been removed.');
+      }
+      if (this.isBotCheckError(result.stderr)) {
+        throw new Error(
+          'YouTube is requesting bot verification. The stored cookies may be expired. ' +
+          'Please refresh your cookies.txt and redeploy.'
+        );
+      }
+      if (this.isAgeOrAuthError(result.stderr)) {
+        throw new Error(
+          'This playlist requires YouTube sign-in. Configure YOUTUBE_COOKIES_PATH with a valid cookies.txt file.'
+        );
+      }
+      if (result.stderr.includes('timed out')) {
+        throw new Error('Playlist fetch timed out. The playlist may be very large or YouTube is rate-limiting requests.');
+      }
+
+      const suffix = detail ? `: ${detail}` : '';
+      throw new Error(`Failed to retrieve playlist information${suffix}. Please ensure the URL is valid and the playlist is public.`);
     }
 
     try {
