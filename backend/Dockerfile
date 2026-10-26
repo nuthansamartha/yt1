@@ -1,6 +1,4 @@
-```dockerfile
 FROM node:20-alpine
-
 # Install Python, FFmpeg, and dependencies
 RUN apk add --no-cache \
     python3 \
@@ -39,4 +37,3 @@ EXPOSE 5000
 
 # Start backend
 CMD ["node", "dist/server.js"]
-```
