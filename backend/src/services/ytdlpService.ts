@@ -562,65 +562,94 @@ export class YtdlpService {
       }
     };
 
-    const buildDownloadArgs = (mode: 'plain' | 'bypass' | 'cookies', browserName?: string): string[] => {
-      const args: string[] = [
-        '--no-playlist',
-        '--no-warnings',
-        '--newline',
-        // Concurrent fragment downloads make DASH streams finish much faster
-        '-N', '4',
-        '--user-agent',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        '-o', outputTemplate,
-      ];
+    const buildDownloadArgs = (
+  mode: 'plain' | 'bypass' | 'cookies',
+  browserName?: string
+): string[] => {
+  const args: string[] = [
+    '--no-playlist',
+    '--no-warnings',
+    '--newline',
+    '-N', '4',
+    '--user-agent',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    '-o', outputTemplate,
+  ];
 
-      if (mode !== 'plain') {
-        args.push(...this.buildAgeBypassArgs());
-      }
+  // Apply age-bypass arguments when required.
+  if (mode !== 'plain') {
+    args.push(...this.buildAgeBypassArgs());
+  }
 
-      // Cookies strategy: plain mode tries WITHOUT cookies first (same rationale as
-      // getVideoInfo — reduces session fingerprinting). If plain fails with a bot-check,
-      // the caller retries in 'bypass' or 'cookies' mode which includes the cookies file.
-      const cookiesFile = this.getCookiesFilePath();
-      if (mode !== 'plain' && cookiesFile) {
-        args.push('--cookies', cookiesFile);
-      } else if (mode === 'cookies' && browserName && !cookiesFile) {
-        args.push('--cookies-from-browser', browserName);
-      }
+  // Cookie authentication strategy.
+  const cookiesFile = this.getCookiesFilePath();
 
-      if (ffmpegLocation) {
-        args.push('--ffmpeg-location', ffmpegLocation);
-      }
+  if (mode !== 'plain' && cookiesFile) {
+    args.push('--cookies', cookiesFile);
+  } else if (mode === 'cookies' && browserName && !cookiesFile) {
+    args.push('--cookies-from-browser', browserName);
+  }
 
-      if (format === 'mp3') {
-        if (!this.isFfmpegAvailable) {
-          throw new Error('FFmpeg is not installed on the server — MP3 extraction is unavailable. Run backend/bin/download_deps.ps1 or install FFmpeg on the system PATH.');
-        }
-        args.push('-x', '--audio-format', 'mp3');
-        if (typeof quality === 'number' || (typeof quality === 'string' && !isNaN(Number(quality)))) {
-          args.push('--audio-quality', `${Number(quality)}k`);
-        } else {
-          args.push('--audio-quality', '0');
-        }
-      } else if (!this.isFfmpegAvailable) {
-        // Without ffmpeg we cannot merge separate video+audio DASH streams;
-        // fall back to a single progressive stream (capped at 720p by YouTube).
-        const heightNum = typeof quality === 'number' ? quality : Number(quality);
-        const capFilter = !isNaN(heightNum) && heightNum > 0 ? `[height<=${heightNum}]` : '';
-        args.push('-f', `best${capFilter}[ext=mp4]/best${capFilter}/best`);
-      } else {
-        if (quality === 'best' || !quality) {
-          args.push('-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best');
-        } else {
-          const heightNum = Number(quality);
-          args.push('-f', `bestvideo[height<=${heightNum}]+bestaudio/best[height<=${heightNum}]/best`);
-        }
-        args.push('--merge-output-format', 'mp4');
-      }
+  // Specify FFmpeg location if configured.
+  if (ffmpegLocation) {
+    args.push('--ffmpeg-location', ffmpegLocation);
+  }
 
-      args.push(url);
-      return args;
-    };
+  // MP3 audio extraction.
+  if (format === 'mp3') {
+    if (!this.isFfmpegAvailable) {
+      throw new Error(
+        'FFmpeg is not installed on the server — MP3 extraction is unavailable. Run backend/bin/download_deps.ps1 or install FFmpeg on the system PATH.'
+      );
+    }
+
+    args.push('-x', '--audio-format', 'mp3');
+
+    if (
+      typeof quality === 'number' ||
+      (typeof quality === 'string' && quality.trim() !== '' && !isNaN(Number(quality)))
+    ) {
+      args.push('--audio-quality', `${Number(quality)}k`);
+    } else {
+      args.push('--audio-quality', '0');
+    }
+  } else {
+    // Video download.
+    const heightNum = Number(quality);
+
+    const hasHeightLimit =
+      quality !== undefined &&
+      quality !== null &&
+      quality !== '' &&
+      quality !== 'best' &&
+      Number.isFinite(heightNum) &&
+      heightNum > 0;
+
+    const heightFilter = hasHeightLimit
+      ? `[height<=${heightNum}]`
+      : '';
+
+    if (!this.isFfmpegAvailable) {
+      // Without FFmpeg, use a single progressive stream.
+      args.push(
+        '-f',
+        `best${heightFilter}[ext=mp4]/best${heightFilter}/best`
+      );
+    } else {
+      // Prefer compatible MP4 streams, but allow other formats as fallbacks.
+      const formatSelector = hasHeightLimit
+        ? `bestvideo*[height<=${heightNum}]+bestaudio/best[height<=${heightNum}]/best`
+        : 'bestvideo*+bestaudio/best';
+
+      args.push('-f', formatSelector);
+      args.push('--merge-output-format', 'mp4');
+    }
+  }
+
+  args.push(url);
+
+  return args;
+};
 
     const cleanPartialFiles = (): void => {
       try {
